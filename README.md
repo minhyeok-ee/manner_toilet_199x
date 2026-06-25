@@ -231,17 +231,7 @@ RAW,2,15,-1,7,11
 
 ---
 
-## 11. Python Requirements
-
-필요한 Python 패키지:
-
-```bash
-pip install pyserial numpy matplotlib
-```
-
----
-
-## 12. Run Visualizer
+## 11. Run Visualizer
 
 macOS에서 Serial 포트 확인:
 
@@ -271,19 +261,7 @@ python tools/spectrogram_4ch.py
 
 ---
 
-## 13. Upload Firmware
-
-Portenta H7을 연결한 뒤 PlatformIO에서 업로드합니다.
-
-```bash
-pio run --target upload
-```
-
-업로드가 실패하면 Portenta H7의 RESET 버튼을 빠르게 두 번 눌러 DFU 모드로 진입한 뒤 다시 업로드합니다.
-
----
-
-## 14. Test Procedure
+## 12. Test Procedure
 
 1. PCM1840 전원과 GND 연결 확인
 2. PCM1840 모드 설정 핀 확인
@@ -296,7 +274,7 @@ pio run --target upload
 
 ---
 
-## 15. Current Status
+## 13. Current Status
 
 현재까지 완료한 내용:
 
@@ -310,7 +288,7 @@ pio run --target upload
 
 ---
 
-## 16. Next Steps
+## 14. Next Steps
 
 다음 단계는 다음 순서로 진행할 예정입니다.
 
@@ -328,7 +306,7 @@ pio run --target upload
 
 ---
 
-## 17. Notes
+## 15. Notes
 
 현재 코드는 실시간 ANC용 최종 구조가 아니라 **하드웨어 입력 검증용 테스트 코드**입니다.
 
@@ -346,27 +324,4 @@ DSP processing
 classification / TDOA / ANC
 ↓
 audio output
-```
-
----
-
-## 18. Git Commands
-
-처음 GitHub에 올릴 때:
-
-```bash
-git init
-git add .
-git commit -m "Initial Portenta H7 PCM1840 SAI TDM test"
-git branch -M main
-git remote add origin https://github.com/YOUR_USERNAME/toilet-noise-cancellation.git
-git push -u origin main
-```
-
-이후 수정사항 업로드:
-
-```bash
-git add .
-git commit -m "Update project"
-git push
 ```
