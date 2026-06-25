@@ -66,11 +66,33 @@ static constexpr bool STREAM_BINARY = true;
 static constexpr uint16_t RAW_DECIMATION = 3;
 static constexpr uint8_t FRAME_BYTES = 4 + CHANNEL_COUNT * 2; // magic+seq + 4*i16 = 12
 
-// 수신 버퍼
+// 수신 버퍼 (레거시 블로킹 모드용)
 static uint32_t rxBuffer[WORDS_PER_BLOCK];
 
 static uint32_t blockSeq = 0;
 static uint32_t rawSeq = 0;
+
+// ------------------------------------------------------
+// DMA 순환버퍼 (STREAM_BINARY 모드)
+//
+// 핑퐁: DMA가 한 절반을 채우는 동안 CPU는 반대 절반을 처리.
+// IRQ를 쓰지 않고 메인루프에서 NDTR 카운터를 폴링해 완성 절반을 감지
+// -> mbed 코어가 선점한 DMA IRQ 핸들러와 충돌하지 않음.
+//
+// 캐시: dmaBuf 는 캐시 가능한 AXI SRAM 에 잡히므로, 각 절반을 읽기 전
+//       SCB_InvalidateDCache_by_Addr 로 무효화해야 DMA 최신값을 읽는다.
+//       이를 위해 32바이트 정렬 + 절반 크기를 32바이트 배수로 둔다.
+// ------------------------------------------------------
+static constexpr uint16_t HALF_FRAMES = 256;                       // 절반당 프레임
+static constexpr uint16_t HALF_WORDS = HALF_FRAMES * CHANNEL_COUNT; // 1024 word
+static constexpr uint16_t DMA_TOTAL_WORDS = HALF_WORDS * 2;         // 2048 word
+
+// HALF_WORDS*4 = 4096 byte 는 32 의 배수여야 캐시라인 단위로 정확히 무효화됨
+static_assert((HALF_WORDS * sizeof(uint32_t)) % 32 == 0,
+              "DMA half size must be a multiple of 32 bytes for cache ops");
+
+static uint32_t dmaBuf[DMA_TOTAL_WORDS] __attribute__((aligned(32)));
+static DMA_HandleTypeDef hdma_sai2_rx;
 
 // ------------------------------------------------------
 // Portenta H7 High Density Connector 기준
@@ -95,6 +117,26 @@ extern "C" void HAL_SAI_MspInit(SAI_HandleTypeDef *hsai) {
         GPIO_InitStruct.Alternate = GPIO_AF10_SAI2;
 
         HAL_GPIO_Init(GPIOI, &GPIO_InitStruct);
+
+        // -------- SAI2_A RX DMA (순환, 폴링) --------
+        // DMA1/DMA2 는 D2 도메인 마스터라 SAI2 와 AXI SRAM 모두 접근 가능.
+        // NVIC IRQ 는 일부러 켜지 않음: 메인루프에서 NDTR 폴링으로 처리.
+        __HAL_RCC_DMA1_CLK_ENABLE();
+
+        hdma_sai2_rx.Instance = DMA1_Stream0;
+        hdma_sai2_rx.Init.Request = DMA_REQUEST_SAI2_A;
+        hdma_sai2_rx.Init.Direction = DMA_PERIPH_TO_MEMORY;
+        hdma_sai2_rx.Init.PeriphInc = DMA_PINC_DISABLE;
+        hdma_sai2_rx.Init.MemInc = DMA_MINC_ENABLE;
+        hdma_sai2_rx.Init.PeriphDataAlignment = DMA_PDATAALIGN_WORD;
+        hdma_sai2_rx.Init.MemDataAlignment = DMA_MDATAALIGN_WORD;
+        hdma_sai2_rx.Init.Mode = DMA_CIRCULAR;
+        hdma_sai2_rx.Init.Priority = DMA_PRIORITY_HIGH;
+        hdma_sai2_rx.Init.FIFOMode = DMA_FIFOMODE_DISABLE;
+
+        HAL_DMA_Init(&hdma_sai2_rx);
+
+        __HAL_LINKDMA(hsai, hdmarx, hdma_sai2_rx);
     }
 }
 
@@ -216,14 +258,16 @@ static inline void putLE16(uint8_t *p, uint16_t v) {
     p[1] = static_cast<uint8_t>((v >> 8) & 0xFF);
 }
 
-static void streamBinaryBlock() {
-    // 블록당 최대 (64/decim + 1) 프레임. 여유 +2 프레임 확보.
-    static uint8_t txBuf[(FRAMES_PER_BLOCK / 1 + 2) * FRAME_BYTES];
+// 임의 버퍼(frames 프레임)를 연속 데시메이션하여 바이너리 프레임으로 송출.
+// decimAcc / decimCount 가 static 이라 호출 간(=DMA 절반 간) 데시메이션이 이어짐.
+static void streamBinaryFrames(const uint32_t *buf, uint16_t frames) {
+    // 최대 frames/RAW_DECIMATION (+여유 2) 프레임 발생.
+    static uint8_t txBuf[(HALF_FRAMES / RAW_DECIMATION + 2) * FRAME_BYTES];
     uint16_t len = 0;
 
-    for (uint16_t frame = 0; frame < FRAMES_PER_BLOCK; frame++) {
+    for (uint16_t frame = 0; frame < frames; frame++) {
         for (uint8_t ch = 0; ch < CHANNEL_COUNT; ch++) {
-            decimAcc[ch] += toTestSample(rxBuffer[frame * CHANNEL_COUNT + ch]);
+            decimAcc[ch] += toTestSample(buf[frame * CHANNEL_COUNT + ch]);
         }
 
         if (++decimCount >= RAW_DECIMATION) {
@@ -246,6 +290,45 @@ static void streamBinaryBlock() {
 
     if (len > 0) {
         Serial.write(txBuf, len);
+    }
+}
+
+// DMA 순환버퍼에서 완성된 절반을 폴링으로 감지 -> 캐시 무효화 -> 송출.
+static void pollAndStreamDMA() {
+    // lastDone: 마지막으로 처리한 절반(0=앞, 1=뒤). 시작값 1 -> 첫 처리는
+    // DMA 가 앞 절반을 다 채우고 뒤로 넘어간 시점의 '앞 절반'(진짜 완성본)부터.
+    static int lastDone = 1;
+
+    uint16_t ndtr = __HAL_DMA_GET_COUNTER(&hdma_sai2_rx);
+
+    // DMA 기록 위치 = DMA_TOTAL_WORDS - ndtr.
+    // ndtr > HALF_WORDS  -> DMA 가 '앞 절반'을 쓰는 중 -> '뒤 절반'이 완성됨.
+    bool writingFirstHalf = (ndtr > HALF_WORDS);
+
+    if (writingFirstHalf) {
+        if (lastDone != 1) {
+            uint32_t *half = &dmaBuf[HALF_WORDS];
+            SCB_InvalidateDCache_by_Addr(half, HALF_WORDS * sizeof(uint32_t));
+            streamBinaryFrames(half, HALF_FRAMES);
+            lastDone = 1;
+
+            blockSeq++;
+            if (blockSeq % 50 == 0) {
+                digitalWrite(LEDB, !digitalRead(LEDB));
+            }
+        }
+    } else {
+        if (lastDone != 0) {
+            uint32_t *half = &dmaBuf[0];
+            SCB_InvalidateDCache_by_Addr(half, HALF_WORDS * sizeof(uint32_t));
+            streamBinaryFrames(half, HALF_FRAMES);
+            lastDone = 0;
+
+            blockSeq++;
+            if (blockSeq % 50 == 0) {
+                digitalWrite(LEDB, !digitalRead(LEDB));
+            }
+        }
     }
 }
 
@@ -307,9 +390,33 @@ void setup() {
     }
 
     Serial.println("SAI2 init OK");
+
+    if (STREAM_BINARY) {
+        // 순환 DMA 시작 (한 번만 호출, 이후 하드웨어가 계속 채움)
+        HAL_StatusTypeDef dmaStatus = HAL_SAI_Receive_DMA(
+            &hsai2a,
+            reinterpret_cast<uint8_t *>(dmaBuf),
+            DMA_TOTAL_WORDS
+        );
+
+        if (dmaStatus != HAL_OK) {
+            Serial.print("ERROR: SAI DMA start failed, status=");
+            Serial.println(static_cast<int>(dmaStatus));
+        } else {
+            Serial.println("SAI DMA streaming started");
+        }
+    }
 }
 
 void loop() {
+    if (STREAM_BINARY) {
+        // 순환 DMA + 캐시 무효화 기반 스트리밍 (블로킹 수신 없음).
+        // 절반(256 frame @48k ≈ 5.3ms)보다 빠르게만 폴링하면 손실 없음.
+        pollAndStreamDMA();
+        return;
+    }
+
+    // ---- 레거시 ASCII 디버그 모드 (블로킹 폴링 수신) ----
     HAL_StatusTypeDef status = HAL_SAI_Receive(
         &hsai2a,
         reinterpret_cast<uint8_t *>(rxBuffer),
@@ -325,17 +432,12 @@ void loop() {
             digitalWrite(LEDB, !digitalRead(LEDB));
         }
 
-        if (STREAM_BINARY) {
-            // 바이너리 스트리밍 모드: 끊김 없는 연속 데시메이션 출력만 수행
-            streamBinaryBlock();
-        } else {
-            if (blockSeq % PRINT_STATS_EVERY_N_BLOCKS == 0) {
-                printStats();
-            }
+        if (blockSeq % PRINT_STATS_EVERY_N_BLOCKS == 0) {
+            printStats();
+        }
 
-            if (PRINT_RAW_SAMPLES && blockSeq % PRINT_RAW_EVERY_N_BLOCKS == 0) {
-                printRawSamples();
-            }
+        if (PRINT_RAW_SAMPLES && blockSeq % PRINT_RAW_EVERY_N_BLOCKS == 0) {
+            printRawSamples();
         }
     } else {
         Serial.print("ERROR: HAL_SAI_Receive failed, status=");
