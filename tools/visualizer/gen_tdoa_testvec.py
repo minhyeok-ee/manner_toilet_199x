@@ -16,10 +16,11 @@ WINDOW = 2048
 NFFT = 4096
 FS = 48000.0
 C = 343.0
-MAX_LAG = 64
+MAX_LAG = 96
 FMIN, FMAX = 200.0, 8000.0
-GRID_MIN, GRID_MAX, GRID_STEP = -0.35, 0.35, 0.01
-ARR_W, ARR_H = 0.233, 0.326
+# 탐색 격자: ±10cm 0.5cm -> tdoa.h (GRID_N=41) 와 일치
+GRID_MIN, GRID_MAX, GRID_STEP = -0.10, 0.10, 0.005
+ARR_W, ARR_H = 0.45, 0.45
 
 MIC = np.array([
     [-ARR_W/2, -ARR_H/2],
@@ -29,7 +30,7 @@ MIC = np.array([
 ], dtype=np.float64)
 PAIRS = [(0,1),(0,2),(0,3),(1,2),(1,3),(2,3)]
 
-TRUE_SRC = np.array([0.05, -0.08])   # 알려진 음원 위치 (그리드 위)
+TRUE_SRC = np.array([0.030, -0.040])  # 알려진 음원 위치 (15cm 존 안)
 AMP = 8000.0
 
 # ---- 그리드 / lag / 밴드마스크 (cfft 와 동치인 rfft 사용) ----

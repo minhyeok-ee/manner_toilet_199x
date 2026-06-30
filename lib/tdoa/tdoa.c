@@ -16,19 +16,21 @@
 #define NFFT       4096
 #define FS         48000.0f
 #define C_SOUND    343.0f
-#define MAX_LAG    64                 /* >= 최대 baseline tau(~56샘플) */
+#define MAX_LAG    96                 /* >= 최대 baseline tau (45cm 정사각 대각선 63.6cm -> ~89샘플) */
 #define NLAG       (2 * MAX_LAG + 1)
 #define FMIN       200.0f
 #define FMAX       8000.0f
 
-#define GRID_MIN   (-0.35f)
-#define GRID_MAX   ( 0.35f)
-#define GRID_STEP  ( 0.01f)
-#define GRID_N     71                 /* round((0.35-(-0.35))/0.01)+1 */
+/* 존 격자 (tdoa.h 정의). 변기 고정 -> 작은 고정 영역을 촘촘히 탐색. */
+#define G_N        TDOA_GRID_N
+#define G_STEP     TDOA_GRID_STEP
+#define G_HALF     ((TDOA_GRID_N - 1) / 2)
+#define G_MIN_X    (TDOA_ZONE_CX - (float)G_HALF * TDOA_GRID_STEP)
+#define G_MIN_Y    (TDOA_ZONE_CY - (float)G_HALF * TDOA_GRID_STEP)
 
-/* 어레이: 대각선 40cm, 긴 축(y)=전후방. CH 순서 = 좌하,우하,우상,좌상 */
-#define ARR_W_MM   233
-#define ARR_H_MM   326
+/* 어레이: 45cm 정사각형, 모서리에 마이크. CH 순서 = 좌하,우하,우상,좌상 */
+#define ARR_W_MM   450
+#define ARR_H_MM   450
 #define ARR_W      (ARR_W_MM / 1000.0f)
 #define ARR_H      (ARR_H_MM / 1000.0f)
 
@@ -86,7 +88,7 @@ static inline float interp_lag(const float *cc, float tau)
     return cc[i0] * (1.0f - frac) + cc[i0 + 1] * frac;
 }
 
-tdoa_result_t tdoa_localize(const float *win)
+tdoa_result_t tdoa_localize(const float *win, float *srp_out)
 {
     tdoa_result_t res = { 0.0f, 0.0f, -FLT_MAX };
     int ch, k, p, a;
@@ -141,11 +143,14 @@ tdoa_result_t tdoa_localize(const float *win)
 
     /* 3) SRP-PHAT 그리드 탐색 (on-the-fly tau) */
     {
+        static float g_srp[TDOA_GRID_CELLS];   // 내부 맵 (포물선 보간용)
         int ix, iy;
-        for (iy = 0; iy < GRID_N; iy++) {
-            float y = GRID_MIN + (float)iy * GRID_STEP;
-            for (ix = 0; ix < GRID_N; ix++) {
-                float x = GRID_MIN + (float)ix * GRID_STEP;
+        int bestix = 0, bestiy = 0;
+
+        for (iy = 0; iy < G_N; iy++) {
+            float y = G_MIN_Y + (float)iy * G_STEP;
+            for (ix = 0; ix < G_N; ix++) {
+                float x = G_MIN_X + (float)ix * G_STEP;
 
                 float dist[TDOA_CH];
                 for (ch = 0; ch < TDOA_CH; ch++) {
@@ -158,13 +163,44 @@ tdoa_result_t tdoa_localize(const float *win)
                     float tau = (dist[PAIR[p][0]] - dist[PAIR[p][1]]) / C_SOUND * FS;
                     srp += interp_lag(ccLag[p], tau);
                 }
+                g_srp[iy * G_N + ix] = srp;
+                if (srp_out) {
+                    srp_out[iy * G_N + ix] = srp;
+                }
                 if (srp > res.power) {
                     res.power = srp;
-                    res.x = x;
-                    res.y = y;
+                    bestix = ix;
+                    bestiy = iy;
                 }
             }
         }
+
+        // 서브격자 포물선 보간: 피크 주변 3점으로 0.5cm 격자보다 정밀한 위치
+        float fx = (float)bestix, fy = (float)bestiy;
+        if (bestix > 0 && bestix < G_N - 1) {
+            float sm = g_srp[bestiy * G_N + bestix - 1];
+            float s0 = g_srp[bestiy * G_N + bestix];
+            float sp = g_srp[bestiy * G_N + bestix + 1];
+            float den = sm - 2.0f * s0 + sp;
+            if (fabsf(den) > 1e-9f) {
+                float d = 0.5f * (sm - sp) / den;
+                if (d > 0.5f) d = 0.5f; else if (d < -0.5f) d = -0.5f;
+                fx += d;
+            }
+        }
+        if (bestiy > 0 && bestiy < G_N - 1) {
+            float sm = g_srp[(bestiy - 1) * G_N + bestix];
+            float s0 = g_srp[bestiy * G_N + bestix];
+            float sp = g_srp[(bestiy + 1) * G_N + bestix];
+            float den = sm - 2.0f * s0 + sp;
+            if (fabsf(den) > 1e-9f) {
+                float d = 0.5f * (sm - sp) / den;
+                if (d > 0.5f) d = 0.5f; else if (d < -0.5f) d = -0.5f;
+                fy += d;
+            }
+        }
+        res.x = G_MIN_X + fx * G_STEP;
+        res.y = G_MIN_Y + fy * G_STEP;
     }
     return res;
 }

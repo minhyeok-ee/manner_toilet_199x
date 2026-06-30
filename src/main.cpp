@@ -355,12 +355,13 @@ static void pollAndStreamDMA() {
 //   [pwr   u16]  SRP 피크 * 100 (0 = 무음/게이트 차단)
 // ======================================================
 static constexpr bool LIVE_TDOA = true;
-static constexpr float TDOA_RMS_THR = 30.0f;          // 이상일 때만 위치 계산 (튜닝)
-static constexpr uint16_t LOCALIZE_EVERY_HALVES = 8;  // 8 half(~43ms) -> ~23Hz
+static constexpr uint16_t LOCALIZE_EVERY_HALVES = 4;  // 4 half(~21ms) -> ~46Hz
 
 static float winbuf[TDOA_WINDOW * CHANNEL_COUNT];      // 시간순 윈도우 (32KB)
 static uint16_t resultSeq = 0;
 
+// 결과 패킷 (Little-Endian, 12B):
+//   [C3 3C][seq u16][x_mm i16][y_mm i16][rms u16][pwr u16(SRP피크*100)]
 static void sendTdoaResult(int16_t x_mm, int16_t y_mm, uint16_t rms, uint16_t pwr) {
     uint8_t pkt[12];
     pkt[0] = 0xC3;
@@ -419,7 +420,7 @@ static void pollAndLocalize() {
     }
     halfCount = 0;
 
-    // 윈도우 RMS (에너지 게이트)
+    // 윈도우 RMS (PC 표시/감도용; 하드 게이트는 PC 측에서)
     const uint32_t N = TDOA_WINDOW * CHANNEL_COUNT;
     float ms = 0.0f;
     for (uint32_t i = 0; i < N; i++) {
@@ -428,17 +429,15 @@ static void pollAndLocalize() {
     float rms = sqrtf(ms / (float)N);
     uint16_t rms_u = (rms > 65535.0f) ? 65535u : static_cast<uint16_t>(rms);
 
-    if (rms >= TDOA_RMS_THR) {
-        tdoa_result_t r = tdoa_localize(winbuf);
-        int16_t xm = static_cast<int16_t>(lroundf(r.x * 1000.0f));
-        int16_t ym = static_cast<int16_t>(lroundf(r.y * 1000.0f));
-        float pf = r.power * 100.0f;
-        uint16_t pu = (pf < 1.0f) ? 1u
-                    : (pf > 65535.0f ? 65535u : static_cast<uint16_t>(pf));
-        sendTdoaResult(xm, ym, rms_u, pu);
-    } else {
-        sendTdoaResult(0, 0, rms_u, 0);   // 무음: pwr=0
-    }
+    // 위치추정 (SRP 맵 불필요 -> NULL). 포물선 보간으로 격자보다 정밀.
+    tdoa_result_t r = tdoa_localize(winbuf, nullptr);
+
+    int16_t xm = static_cast<int16_t>(lroundf(r.x * 1000.0f));
+    int16_t ym = static_cast<int16_t>(lroundf(r.y * 1000.0f));
+    float pf = r.power * 100.0f;
+    uint16_t pu = (pf < 0.0f) ? 0u
+                : (pf > 65535.0f ? 65535u : static_cast<uint16_t>(pf));
+    sendTdoaResult(xm, ym, rms_u, pu);
 }
 
 static void printRawSamples() {
@@ -466,7 +465,7 @@ static constexpr bool TDOA_SELFTEST = true;
 
 static void tdoaSelfTest() {
     tdoa_init();
-    tdoa_result_t r = tdoa_localize(tdoa_testvec);
+    tdoa_result_t r = tdoa_localize(tdoa_testvec, nullptr);
 
     float ex = TV_EXP_X, ey = TV_EXP_Y;
     float dx = r.x - ex, dy = r.y - ey;
@@ -534,7 +533,7 @@ void setup() {
     Serial.println("Expected BCLK : 6144000 Hz");
 
     if (LIVE_TDOA) {
-        Serial.println("MODE: LIVE TDOA (on-device localization)");
+        Serial.println("MODE: LIVE TDOA (on-device, 15cm zone, parabolic)");
         Serial.println("Result: [C3 3C][seq u16][x_mm i16][y_mm i16][rms u16][pwr u16] LE, 12 bytes");
     } else if (STREAM_BINARY) {
         Serial.print("MODE: BINARY STREAM, decim=");

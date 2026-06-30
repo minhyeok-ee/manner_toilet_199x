@@ -1,66 +1,61 @@
 """
-라이브 TDOA 뷰어 — 보드(M7)가 온디바이스로 계산한 위치 결과를 받아 표시만 한다.
+라이브 TDOA 정밀 측정 뷰어.
 
-펌웨어 LIVE_TDOA 모드의 결과 패킷 (Little-Endian, 12B):
+보드(M7)가 ±10cm 격자에서 SRP-PHAT(+포물선 보간)으로 진원지를 계산해 보낸다.
+PC 는: 현재 추정을 항상 표시 + 최근 프레임 '중앙값'으로 정밀 측정(±std) +
+       검출을 세기별 색으로 누적 로그 + 15cm 관심원 표시.
+
+결과 패킷 (Little-Endian, 12B):
   [0xC3][0x3C] magic
   [seq   u16]
-  [x_mm  i16]  음원 x [mm]
-  [y_mm  i16]  음원 y [mm]
-  [rms   u16]  윈도우 RMS
-  [pwr   u16]  SRP 피크*100 (0 = 무음)
+  [x_mm  i16]  진원지 x [mm]
+  [y_mm  i16]  진원지 y [mm]
+  [rms   u16]  세기
+  [pwr   u16]  SRP 피크*100 (신뢰도)
 
-PC 는 FFT/SRP 계산을 하지 않는다 — 그냥 받은 (x,y) 를 그린다.
+키: 'c' = 로그/측정 초기화
 """
 
-import time
+import struct
 from collections import deque
 from threading import Thread, Event
 
 import numpy as np
 import serial
 import pyqtgraph as pg
-from pyqtgraph.Qt import QtCore
+from pyqtgraph.Qt import QtCore, QtWidgets
 
 # =========================================================
-# 설정
+# 설정 (펌웨어 tdoa.h 와 일치)
 # =========================================================
 
 SERIAL_PORT = "COM3"
 BAUD_RATE = 2000000
 
-# 어레이 기하 (펌웨어 tdoa.c 와 일치) — 표시용
-ARR_W, ARR_H = 0.233, 0.326
-MIC = np.array([
-    [-ARR_W/2, -ARR_H/2],
-    [ ARR_W/2, -ARR_H/2],
-    [ ARR_W/2,  ARR_H/2],
-    [-ARR_W/2,  ARR_H/2],
-], dtype=np.float64)
+GRID_HALF = 0.10        # 격자 ±10cm (tdoa.h GRID_N=41, STEP=0.5cm)
+ROI_R = 0.075           # 15cm 관심원 (반지름 7.5cm)
+VIEW = GRID_HALF + 0.012
 
-VIEW = 0.35          # 표시 범위 ±VIEW [m]
-PWR_VALID = 1        # pwr >= 이 값이면 유효 위치 (펌웨어가 무음 시 0 전송)
-TRAIL = 12           # 위치 잔상 개수
+# 측정/로그 (관측 위해 임계 낮게; idle rms 보고 올려라)
+RMS_LOG = 2.0           # 이 RMS 이상이면 측정/로그에 포함
+RMS_MAX = 40.0          # 색이 빨강으로 포화되는 RMS
+SMOOTH_N = 15           # 최근 N 프레임 중앙값으로 정밀 측정 (~0.3s)
+MAXLOG = 2000
 
-MAGIC = 0x3CC3       # 바이트 C3 3C 의 LE uint16
-PKT_DTYPE = np.dtype([
-    ("magic", "<u2"),
-    ("seq", "<u2"),
-    ("x_mm", "<i2"),
-    ("y_mm", "<i2"),
-    ("rms", "<u2"),
-    ("pwr", "<u2"),
-])
-PKT_BYTES = PKT_DTYPE.itemsize   # 12
+MAGIC = 0x3CC3
+PKT = struct.Struct("<HHhhHH")   # magic, seq, x_mm, y_mm, rms, pwr (12 byte)
+PKT_LEN = PKT.size
 
 # =========================================================
 # 공유 상태
 # =========================================================
 
 stop_event = Event()
-latest = {"x": 0.0, "y": 0.0, "rms": 0, "pwr": 0, "n": 0}
+new_dets = deque()    # (x, y, rms) — reader -> GUI
+cur = {"x": 0.0, "y": 0.0, "rms": 0, "pwr": 0, "n": 0, "on": False}
 
 # =========================================================
-# Serial reader (결과 패킷 파싱)
+# Serial reader
 # =========================================================
 
 def serial_reader():
@@ -90,30 +85,29 @@ def serial_reader():
                     del buf[:-1]
                 continue
             del buf[:idx]
-            if len(buf) < 2 * PKT_BYTES:
+            if len(buf) < 2 * PKT_LEN:
                 continue
-            if buf[PKT_BYTES] == 0xC3 and buf[PKT_BYTES + 1] == 0x3C:
+            if buf[PKT_LEN] == 0xC3 and buf[PKT_LEN + 1] == 0x3C:
                 synced = True
             else:
                 del buf[:1]
                 continue
 
-        n = len(buf) // PKT_BYTES
-        if n == 0:
-            continue
-        raw = bytes(buf[:n * PKT_BYTES])
-        del buf[:n * PKT_BYTES]
-        arr = np.frombuffer(raw, dtype=PKT_DTYPE, count=n)
-        if not np.all(arr["magic"] == MAGIC):
-            synced = False
-            continue
+        while len(buf) >= PKT_LEN:
+            magic, seq, xmm, ymm, rms, pwr = PKT.unpack_from(buf, 0)
+            if magic != MAGIC:
+                synced = False
+                del buf[:1]
+                break
+            del buf[:PKT_LEN]
 
-        last = arr[-1]
-        latest["x"] = int(last["x_mm"]) / 1000.0
-        latest["y"] = int(last["y_mm"]) / 1000.0
-        latest["rms"] = int(last["rms"])
-        latest["pwr"] = int(last["pwr"])
-        latest["n"] += n
+            x, y = xmm / 1000.0, ymm / 1000.0
+            cur.update(x=x, y=y, rms=int(rms), pwr=int(pwr))
+            cur["n"] += 1
+            on = rms >= RMS_LOG
+            cur["on"] = on
+            if on:
+                new_dets.append((x, y, int(rms)))
 
     ser.close()
     print("Serial closed.")
@@ -123,59 +117,118 @@ def serial_reader():
 # =========================================================
 
 pg.setConfigOptions(antialias=True, background="k", foreground="w")
-app = pg.mkQApp("Live TDOA (on-device)")
-win = pg.GraphicsLayoutWidget(show=True, title="Live TDOA — on-device localization")
-win.resize(760, 760)
+app = pg.mkQApp("Live TDOA — precise")
+win = pg.GraphicsLayoutWidget(show=True, title="Live TDOA — precise measurement")
+win.resize(780, 820)
 
 plot = win.addPlot()
 plot.setAspectLocked(True)
 plot.setXRange(-VIEW, VIEW)
 plot.setYRange(-VIEW, VIEW)
-plot.showGrid(x=True, y=True, alpha=0.3)
+plot.showGrid(x=True, y=True, alpha=0.2)
 plot.setLabel("bottom", "X [m]")
 plot.setLabel("left", "Y [m]")
 
-# 마이크 (사각형) + 어레이 외곽
-mic_scatter = pg.ScatterPlotItem(
-    x=MIC[:, 0], y=MIC[:, 1], size=16,
-    pen=pg.mkPen("w"), brush=pg.mkBrush(0, 200, 255, 220), symbol="s")
-plot.addItem(mic_scatter)
-rect = np.vstack([MIC, MIC[0]])
-plot.addItem(pg.PlotDataItem(rect[:, 0], rect[:, 1],
-                             pen=pg.mkPen((0, 200, 255, 90), width=1)))
-for idx, (mx, my) in enumerate(MIC):
-    t = pg.TextItem(f"CH{idx + 1}", color="w", anchor=(0.5, 1.3))
-    t.setPos(mx, my)
-    plot.addItem(t)
+# 15cm 관심원 + 격자 외곽 + 중심 십자
+th = np.linspace(0, 2 * np.pi, 120)
+plot.addItem(pg.PlotDataItem(ROI_R * np.cos(th), ROI_R * np.sin(th),
+                             pen=pg.mkPen((255, 255, 255, 150), width=1.5)))
+plot.addItem(pg.PlotDataItem(
+    [-GRID_HALF, GRID_HALF, GRID_HALF, -GRID_HALF, -GRID_HALF],
+    [-GRID_HALF, -GRID_HALF, GRID_HALF, GRID_HALF, -GRID_HALF],
+    pen=pg.mkPen((100, 100, 100, 120))))
+plot.addItem(pg.PlotDataItem([-ROI_R, ROI_R], [0, 0], pen=pg.mkPen((255, 255, 255, 35))))
+plot.addItem(pg.PlotDataItem([0, 0], [-ROI_R, ROI_R], pen=pg.mkPen((255, 255, 255, 35))))
 
-# 위치 잔상 + 현재 마커
-trail = deque(maxlen=TRAIL)
-trail_scatter = pg.ScatterPlotItem(size=10, pen=None, brush=pg.mkBrush(255, 80, 0, 90))
-plot.addItem(trail_scatter)
-src_scatter = pg.ScatterPlotItem(size=26, pen=pg.mkPen("y", width=3),
-                                 brush=pg.mkBrush(255, 230, 0, 60), symbol="o")
-plot.addItem(src_scatter)
+# 세기 -> 색 LUT
+try:
+    _cmap = pg.colormap.get("turbo")
+except Exception:
+    _cmap = pg.colormap.get("inferno")
+LUT = _cmap.getLookupTable(0.0, 1.0, 256)
+
+def brush_for(rms):
+    t = (rms - RMS_LOG) / max(1e-6, (RMS_MAX - RMS_LOG))
+    i = int(max(0, min(255, t * 255)))
+    return pg.mkBrush(int(LUT[i][0]), int(LUT[i][1]), int(LUT[i][2]), 200)
+
+# 누적 로그 + 현재(순간) 점 + 정밀 측정(중앙값) 마커
+log_scatter = pg.ScatterPlotItem(size=8, pen=None)
+plot.addItem(log_scatter)
+xs, ys, brushes = [], [], []
+
+cur_dot = pg.ScatterPlotItem(size=10, pen=None, brush=pg.mkBrush(255, 255, 255, 130))
+plot.addItem(cur_dot)
+meas_marker = pg.ScatterPlotItem(size=28, pen=pg.mkPen((0, 255, 0), width=3),
+                                 brush=pg.mkBrush(0, 255, 0, 0), symbol="+")
+plot.addItem(meas_marker)
+
+readout = pg.TextItem("", color=(0, 255, 0), anchor=(0, 0))
+readout.setPos(-VIEW * 0.98, VIEW * 0.96)
+plot.addItem(readout)
+
+recent = deque(maxlen=SMOOTH_N)   # 최근 (x,y) — 중앙값 측정용
+
+
+def clear_all():
+    xs.clear(); ys.clear(); brushes.clear()
+    recent.clear()
+    log_scatter.setData([], [])
+
+
+try:
+    _ShortcutCls = getattr(QtWidgets, "QShortcut", None) or pg.QtGui.QShortcut
+    _sc = _ShortcutCls(pg.QtGui.QKeySequence("c"), win)
+    _sc.activated.connect(clear_all)
+except Exception as _e:
+    print("clear shortcut unavailable:", _e)
 
 
 def update():
     if stop_event.is_set() or not win.isVisible():
         return
-    x, y = latest["x"], latest["y"]
-    rms, pwr = latest["rms"], latest["pwr"]
 
-    if pwr >= PWR_VALID:
-        trail.append((x, y))
-        if trail:
-            tx, ty = zip(*trail)
-            trail_scatter.setData(tx, ty)
-        src_scatter.setData([x], [y])
-        win.setWindowTitle(
-            f"Live TDOA | src=({x*100:+.1f}, {y*100:+.1f}) cm | "
-            f"rms {rms} | pwr {pwr/100:.2f} | pkts {latest['n']}")
+    added = False
+    while new_dets:
+        try:
+            x, y, rms = new_dets.popleft()
+        except IndexError:
+            break
+        xs.append(x); ys.append(y); brushes.append(brush_for(rms))
+        recent.append((x, y))
+        added = True
+    over = len(xs) - MAXLOG
+    if over > 0:
+        del xs[:over]; del ys[:over]; del brushes[:over]
+        added = True
+    if added:
+        log_scatter.setData(xs, ys, brush=brushes, size=8, pen=None)
+
+    # 현재(순간) 추정 — 항상 표시(켜져 있으면)
+    if cur["on"]:
+        cur_dot.setData([cur["x"]], [cur["y"]])
     else:
-        src_scatter.setData([], [])
-        win.setWindowTitle(
-            f"Live TDOA | listening... | rms {rms} (thr below) | pkts {latest['n']}")
+        cur_dot.setData([], [])
+
+    # 정밀 측정: 최근 프레임 중앙값 ± std
+    if len(recent) >= 3:
+        arr = np.array(recent)
+        mx, my = float(np.median(arr[:, 0])), float(np.median(arr[:, 1]))
+        std_mm = float(np.hypot(np.std(arr[:, 0]), np.std(arr[:, 1]))) * 1000.0
+        meas_marker.setData([mx], [my])
+        in_roi = "IN" if (mx * mx + my * my) <= ROI_R * ROI_R else "out"
+        readout.setText(
+            f"측정: ({mx*100:+.2f}, {my*100:+.2f}) cm  ±{std_mm:.1f}mm  [{in_roi} 15cm]\n"
+            f"rms {cur['rms']}  pwr {cur['pwr']/100:.2f}  n={len(recent)}  log={len(xs)}")
+    else:
+        meas_marker.setData([], [])
+        readout.setText(
+            f"측정 대기...  rms {cur['rms']}  pwr {cur['pwr']/100:.2f}  "
+            f"(RMS_LOG={RMS_LOG:.0f} 미만이면 안 잡힘)")
+
+    win.setWindowTitle(
+        f"Live TDOA precise | rms {cur['rms']} | pwr {cur['pwr']/100:.2f} | "
+        f"pkts {cur['n']} | log {len(xs)} | 'c'=clear")
 
 
 # =========================================================
@@ -187,7 +240,7 @@ reader_thread.start()
 
 timer = QtCore.QTimer()
 timer.timeout.connect(update)
-timer.start(33)
+timer.start(30)
 
 
 def on_quit():
@@ -197,8 +250,8 @@ def on_quit():
 
 app.aboutToQuit.connect(on_quit)
 
-print("Live TDOA viewer. 보드 근처에서 소리를 내면 위치 마커가 움직입니다.")
-print("listening 만 뜨면 펌웨어 TDOA_RMS_THR 또는 PC PWR_VALID 를 조정하세요.")
+print(f"Live TDOA precise. grid ±{GRID_HALF*100:.0f}cm, ROI 15cm. "
+      f"RMS_LOG={RMS_LOG}. 현재 추정/측정은 항상 표시(진단용). 'c'=clear")
 
 if __name__ == "__main__":
     try:
