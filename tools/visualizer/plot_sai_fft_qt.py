@@ -39,16 +39,17 @@ BAUD_RATE = 2000000
 
 CHANNEL_COUNT = 4
 
-# 펌웨어 RAW_DECIMATION 과 반드시 일치해야 함.
-#   RAW_DECIMATION = 6  -> 48000/6  = 8000 Hz  (관측 ~4000 Hz)
-#   RAW_DECIMATION = 3  -> 48000/3  = 16000 Hz (관측 ~8000 Hz)
-SAMPLE_RATE = 16000
+# 펌웨어 RAW_DECIMATION 과 반드시 일치해야 함. (TDOA 위해 48kHz 풀레이트)
+#   RAW_DECIMATION = 1  -> 48000 Hz       (관측 ~8000 Hz, Nyquist 24000)
+#   RAW_DECIMATION = 3  -> 48000/3 = 16000 Hz
+SAMPLE_RATE = 48000
 
 # 관측할 최대 주파수. Nyquist(SAMPLE_RATE/2) 이하로 둘 것.
 MAX_FREQ = 8000
 
-FFT_SIZE = 512
-HOP_SIZE = 128
+# 48kHz 라 bin 폭 유지를 위해 FFT_SIZE 상향 (2048 -> bin 23.4Hz, frame 42.7ms)
+FFT_SIZE = 2048
+HOP_SIZE = 512
 HISTORY_FRAMES = 100
 
 DB_FLOOR = -120.0

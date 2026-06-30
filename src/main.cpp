@@ -1,8 +1,14 @@
 #include <Arduino.h>
 #include <math.h>
+#include <string.h>   // memmove
 
 #include "stm32h7xx_hal.h"
 #include "stm32h7xx_hal_sai.h"
+
+#include <arm_math.h>   // CMSIS-DSP (lib/CMSIS-DSP)
+
+#include "tdoa.h"          // 온디바이스 TDOA (lib/tdoa)
+#include "tdoa_testvec.h"  // 검증용 테스트벡터 (gen_tdoa_testvec.py 생성)
 
 // ======================================================
 // Portenta H7 + PCM1840 SAI TDM 4CH Test
@@ -63,7 +69,9 @@ static constexpr uint16_t RAW_FRAMES_TO_PRINT = 8;
 //       정밀 측정이 필요하면 별도 저역통과 필터를 둘 것.
 // ======================================================
 static constexpr bool STREAM_BINARY = true;
-static constexpr uint16_t RAW_DECIMATION = 3;
+// TDOA: 시간분해능을 위해 데시메이션 없이 48kHz 풀레이트 스트리밍.
+// (스펙트로그램 뷰는 PC 쪽에서 표시 대역만 잘라 보면 됨)
+static constexpr uint16_t RAW_DECIMATION = 1;
 static constexpr uint8_t FRAME_BYTES = 4 + CHANNEL_COUNT * 2; // magic+seq + 4*i16 = 12
 
 // 수신 버퍼 (레거시 블로킹 모드용)
@@ -332,6 +340,107 @@ static void pollAndStreamDMA() {
     }
 }
 
+// ======================================================
+// 라이브 TDOA: 온디바이스 위치추정 결과를 PC로 송출
+//
+// LIVE_TDOA=true 면 raw 스트리밍 대신, DMA 윈도우로 tdoa_localize 를 돌려
+// 결과 패킷(12B)을 보낸다. PC(tdoa_live.py)는 받아서 마커만 그린다.
+//
+// 결과 패킷 (Little-Endian, 12B):
+//   [0xC3][0x3C] magic
+//   [seq   u16]
+//   [x_mm  i16]  음원 x [mm]
+//   [y_mm  i16]  음원 y [mm]
+//   [rms   u16]  윈도우 RMS
+//   [pwr   u16]  SRP 피크 * 100 (0 = 무음/게이트 차단)
+// ======================================================
+static constexpr bool LIVE_TDOA = true;
+static constexpr float TDOA_RMS_THR = 30.0f;          // 이상일 때만 위치 계산 (튜닝)
+static constexpr uint16_t LOCALIZE_EVERY_HALVES = 8;  // 8 half(~43ms) -> ~23Hz
+
+static float winbuf[TDOA_WINDOW * CHANNEL_COUNT];      // 시간순 윈도우 (32KB)
+static uint16_t resultSeq = 0;
+
+static void sendTdoaResult(int16_t x_mm, int16_t y_mm, uint16_t rms, uint16_t pwr) {
+    uint8_t pkt[12];
+    pkt[0] = 0xC3;
+    pkt[1] = 0x3C;
+    putLE16(&pkt[2], resultSeq++);
+    putLE16(&pkt[4], static_cast<uint16_t>(x_mm));
+    putLE16(&pkt[6], static_cast<uint16_t>(y_mm));
+    putLE16(&pkt[8], rms);
+    putLE16(&pkt[10], pwr);
+    Serial.write(pkt, sizeof(pkt));
+}
+
+// DMA 절반(frames)을 float 로 변환해 시간순 윈도우 뒤에 덧붙임(앞쪽 밀어냄).
+static void appendHalfToWindow(const uint32_t *half, uint16_t frames) {
+    const uint16_t shift = frames * CHANNEL_COUNT;
+    const uint16_t total = TDOA_WINDOW * CHANNEL_COUNT;
+    memmove(winbuf, winbuf + shift, (total - shift) * sizeof(float));
+    float *dst = winbuf + (total - shift);
+    for (uint16_t f = 0; f < frames; f++) {
+        for (uint8_t ch = 0; ch < CHANNEL_COUNT; ch++) {
+            dst[f * CHANNEL_COUNT + ch] =
+                static_cast<float>(toTestSample(half[f * CHANNEL_COUNT + ch]));
+        }
+    }
+}
+
+// 완성된 DMA 절반을 윈도우에 모으고, 주기마다 위치추정+송출.
+static void pollAndLocalize() {
+    static int lastDone = 1;
+    static uint16_t halfCount = 0;
+
+    uint16_t ndtr = __HAL_DMA_GET_COUNTER(&hdma_sai2_rx);
+    bool writingFirstHalf = (ndtr > HALF_WORDS);
+
+    uint32_t *half = nullptr;
+    if (writingFirstHalf && lastDone != 1) {
+        half = &dmaBuf[HALF_WORDS];
+        lastDone = 1;
+    } else if (!writingFirstHalf && lastDone != 0) {
+        half = &dmaBuf[0];
+        lastDone = 0;
+    }
+    if (half == nullptr) {
+        return;
+    }
+
+    SCB_InvalidateDCache_by_Addr(half, HALF_WORDS * sizeof(uint32_t));
+    appendHalfToWindow(half, HALF_FRAMES);
+
+    if (++blockSeq % 50 == 0) {
+        digitalWrite(LEDB, !digitalRead(LEDB));
+    }
+
+    if (++halfCount < LOCALIZE_EVERY_HALVES) {
+        return;
+    }
+    halfCount = 0;
+
+    // 윈도우 RMS (에너지 게이트)
+    const uint32_t N = TDOA_WINDOW * CHANNEL_COUNT;
+    float ms = 0.0f;
+    for (uint32_t i = 0; i < N; i++) {
+        ms += winbuf[i] * winbuf[i];
+    }
+    float rms = sqrtf(ms / (float)N);
+    uint16_t rms_u = (rms > 65535.0f) ? 65535u : static_cast<uint16_t>(rms);
+
+    if (rms >= TDOA_RMS_THR) {
+        tdoa_result_t r = tdoa_localize(winbuf);
+        int16_t xm = static_cast<int16_t>(lroundf(r.x * 1000.0f));
+        int16_t ym = static_cast<int16_t>(lroundf(r.y * 1000.0f));
+        float pf = r.power * 100.0f;
+        uint16_t pu = (pf < 1.0f) ? 1u
+                    : (pf > 65535.0f ? 65535u : static_cast<uint16_t>(pf));
+        sendTdoaResult(xm, ym, rms_u, pu);
+    } else {
+        sendTdoaResult(0, 0, rms_u, 0);   // 무음: pwr=0
+    }
+}
+
 static void printRawSamples() {
     for (uint16_t frame = 0; frame < RAW_FRAMES_TO_PRINT; frame++) {
         Serial.print("RAW,");
@@ -349,6 +458,66 @@ static void printRawSamples() {
     }
 }
 
+// CMSIS-DSP 링크/동작 자가진단 (FFT + LMS 에코필터 + 복소/통계 함수)
+static constexpr bool CMSIS_SELFTEST = true;
+
+// 온디바이스 TDOA 자가진단: 임베드된 테스트벡터로 위치추정 -> Python 기대값과 대조
+static constexpr bool TDOA_SELFTEST = true;
+
+static void tdoaSelfTest() {
+    tdoa_init();
+    tdoa_result_t r = tdoa_localize(tdoa_testvec);
+
+    float ex = TV_EXP_X, ey = TV_EXP_Y;
+    float dx = r.x - ex, dy = r.y - ey;
+    float errcm = sqrtf(dx * dx + dy * dy) * 100.0f;
+
+    Serial.print("TDOA selftest: est=(");
+    Serial.print(r.x * 100.0f, 1);
+    Serial.print(", ");
+    Serial.print(r.y * 100.0f, 1);
+    Serial.print(") cm, expected=(");
+    Serial.print(ex * 100.0f, 1);
+    Serial.print(", ");
+    Serial.print(ey * 100.0f, 1);
+    Serial.print(") cm, err=");
+    Serial.print(errcm, 2);
+    Serial.print("cm -> ");
+    Serial.println(errcm <= 1.5f ? "PASS" : "FAIL");
+}
+
+static void cmsisDspSelfTest() {
+    // 1) 실수 FFT (TDOA용)
+    static float32_t fin[256];
+    static float32_t fout[256];
+    for (int i = 0; i < 256; i++) {
+        fin[i] = arm_sin_f32(2.0f * PI * 10.0f * i / 256.0f);  // FastMath
+    }
+    arm_rfft_fast_instance_f32 S;
+    arm_status st = arm_rfft_fast_init_f32(&S, 256);
+    arm_rfft_fast_f32(&S, fin, fout, 0);
+
+    static float32_t mag[129];
+    arm_cmplx_mag_f32(fout, mag, 128);        // ComplexMath
+
+    float32_t peak;
+    uint32_t peakIdx;
+    arm_max_f32(mag + 1, 128, &peak, &peakIdx); // Statistics (DC 제외)
+
+    // 2) 정규화 LMS (AEC 에코필터)
+    static float32_t lmsCoeff[32] = {0};
+    static float32_t lmsState[32 + 1] = {0};
+    arm_lms_norm_instance_f32 L;
+    arm_lms_norm_init_f32(&L, 32, lmsCoeff, lmsState, 0.1f, 1);  // Filtering
+
+    Serial.print("CMSIS-DSP selftest: rfft_init=");
+    Serial.print(static_cast<int>(st));
+    Serial.print(", peak_bin=");
+    Serial.print(static_cast<int>(peakIdx + 1));
+    Serial.print(" (expect 10), peak_mag=");
+    Serial.println(peak);
+}
+
 void setup() {
     Serial.begin(2000000);
 
@@ -364,7 +533,10 @@ void setup() {
     Serial.println("Expected FSYNC: 48000 Hz");
     Serial.println("Expected BCLK : 6144000 Hz");
 
-    if (STREAM_BINARY) {
+    if (LIVE_TDOA) {
+        Serial.println("MODE: LIVE TDOA (on-device localization)");
+        Serial.println("Result: [C3 3C][seq u16][x_mm i16][y_mm i16][rms u16][pwr u16] LE, 12 bytes");
+    } else if (STREAM_BINARY) {
         Serial.print("MODE: BINARY STREAM, decim=");
         Serial.print(RAW_DECIMATION);
         Serial.print(", out_rate=");
@@ -376,6 +548,14 @@ void setup() {
         Serial.println("STAT,seq,rms1,rms2,rms3,rms4,peak1,peak2,peak3,peak4,mean1,mean2,mean3,mean4");
         Serial.println("RAW format:");
         Serial.println("RAW,seq,ch1,ch2,ch3,ch4");
+    }
+
+    if (CMSIS_SELFTEST) {
+        cmsisDspSelfTest();
+    }
+
+    if (TDOA_SELFTEST) {
+        tdoaSelfTest();
     }
 
     if (!initSAI2_TDM_RX()) {
@@ -391,7 +571,7 @@ void setup() {
 
     Serial.println("SAI2 init OK");
 
-    if (STREAM_BINARY) {
+    if (STREAM_BINARY || LIVE_TDOA) {
         // 순환 DMA 시작 (한 번만 호출, 이후 하드웨어가 계속 채움)
         HAL_StatusTypeDef dmaStatus = HAL_SAI_Receive_DMA(
             &hsai2a,
@@ -409,6 +589,12 @@ void setup() {
 }
 
 void loop() {
+    if (LIVE_TDOA) {
+        // 온디바이스 위치추정: DMA 윈도우 수집 -> 주기적 tdoa_localize -> 결과 송출
+        pollAndLocalize();
+        return;
+    }
+
     if (STREAM_BINARY) {
         // 순환 DMA + 캐시 무효화 기반 스트리밍 (블로킹 수신 없음).
         // 절반(256 frame @48k ≈ 5.3ms)보다 빠르게만 폴링하면 손실 없음.

@@ -1,0 +1,23 @@
+{
+  "name": "CMSIS-DSP",
+  "version": "1.16.2",
+  "description": "ARM CMSIS-DSP (vendored subset: FFT/MFCC, LMS/FIR, complex/basic/fast/stats/support). Aggregate-file compilation to avoid duplicate symbols.",
+  "build": {
+    "srcDir": "Source",
+    "srcFilter": [
+      "-<*>",
+      "+<CommonTables/CommonTables.c>",
+      "+<BasicMathFunctions/BasicMathFunctions.c>",
+      "+<FastMathFunctions/FastMathFunctions.c>",
+      "+<ComplexMathFunctions/ComplexMathFunctions.c>",
+      "+<StatisticsFunctions/StatisticsFunctions.c>",
+      "+<SupportFunctions/SupportFunctions.c>",
+      "+<FilteringFunctions/FilteringFunctions.c>",
+      "+<TransformFunctions/TransformFunctions.c>"
+    ],
+    "flags": [
+      "-I Include",
+      "-I PrivateInclude"
+    ]
+  }
+}
